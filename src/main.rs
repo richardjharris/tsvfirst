@@ -1,122 +1,24 @@
 #[macro_use]
 extern crate clap;
-extern crate regex;
 
 use std::error;
-use std::fs;
 use std::io;
-use std::io::{BufRead, BufReader};
-use std::collections::HashSet;
 use clap::Arg;
 
-type Result<T> = std::result::Result<T, Box<error::Error>>;
+mod config;
+mod tsvfirst;
 
-pub enum RunInput {
-    Stdin,
-    File(String),
-    Data(Vec<u8>),
-}
-pub struct RunConfig {
-    pub fields: Vec<usize>,
-    pub sorted: bool,
-    pub whitespace: bool,
-    pub input: RunInput,
-}
-impl Default for RunConfig {
-    fn default() -> Self {
-        let fields = vec![0];
-        RunConfig {
-            fields,
-            sorted: false,
-            whitespace: false,
-            input: RunInput::Stdin,
-        }
-    }
-}
+use config::Config;
+
+type Result<T> = std::result::Result<T, Box<error::Error>>;
 
 fn main() -> Result<()> {
     let config = get_config()?;
     let mut out = io::stdout();
-
-    // Compile-time specialisation based on input type
-    // (You can still pass a Box<io::Read> for runtime flexibility)
-    match config.input {
-        RunInput::Stdin => {
-            run(&config, &mut io::stdin(), &mut out)
-        },
-        RunInput::File(ref filename) => {
-            run(&config, &mut fs::File::open(filename)?, &mut out)
-        },
-        RunInput::Data(ref data) => {
-            run(&config, &mut io::Cursor::new(data), &mut out)
-        }
-    }
+    tsvfirst::run(&config, &mut out)
 }
 
-fn run<R, W>(config: &RunConfig, input: &mut R, output: &mut W) -> Result<()>
-where R: io::Read, W: io::Write {
-    let delim = if config.whitespace { r"\s+" } else { r"\t" };
-    let splitter = regex::bytes::Regex::new(delim)?;
-
-    // Construct a HashSet to track previously seen values (if sorted not set)
-    let mut seen = HashSet::new();
-    let mut last : Option<Vec<u8>> = None;
-
-    let mut reader = BufReader::new(input);
-    let mut line : Vec<u8> = vec![];
-    while let Ok(_) = reader.read_until(0x0A as u8, &mut line) {
-        if line.is_empty() {
-            // EOF
-            break;
-        }
-
-        // Build sort key
-        let key : Vec<u8> = {
-            let mut fields = splitter.split(&line);
-            let mut key : Vec<u8> = vec![];
-            let mut last_idx = 0;
-
-            for idx in &config.fields {
-                if let Some(column) = fields.nth(idx - last_idx) {
-                    key.append(&mut column.into());
-                    last_idx = idx + 1;
-                }
-                else {
-                    break;
-                }
-            }
-            key
-        };
-
-        let should_print = if config.sorted {
-            // Compare against previous value
-            match last {
-                Some(ref last_key) if *last_key == key => {
-                    false
-                }
-                _ => {
-                    last = Some(key);
-                    true
-                }
-            }
-        }
-        else {
-            // Print if wasn't present in seen set
-            seen.insert(key)
-        };
-
-        if should_print {
-            output.write_all(&line)?;
-        }
-        line.clear();
-    }
-
-    output.flush()?;
-
-    Ok(())
-}
-
-fn get_config() -> Result<RunConfig> {
+fn get_config() -> Result<Config> {
     let args = app_from_crate!()
         .usage("tsvfirst [-f 1,2] [-s] [-w] <file or stdin>")
         .arg(Arg::with_name("fields")
@@ -148,8 +50,12 @@ to compare the previous and current rows to determine uniqueness, rather than
 tracking all previously seen values."))
 
         .arg(Arg::with_name("FILENAME")
-            .index(1)
-            .help("Input filename (defaults to standard input)"))
+            .multiple(true)
+            .help("Input filename/s (defaults to standard input)")
+            .long_help(
+"One or more filenames to use as input: all files will be processed in order
+as if concatenated. If no filenames specified, defaults to standard input.
+The filename of '-' (a single dash) is also taken to mean standard input."))
         .get_matches();
 
     // Fields may be a CSV
@@ -160,14 +66,18 @@ tracking all previously seen values."))
         ::std::process::exit(1);
     });
 
-    let sorted = args.is_present("sorted");
-    let whitespace = args.is_present("whitespace");
-    let input = match args.value_of("FILENAME") {
-        Some(filename) => RunInput::File(filename.to_owned()),
-        None => RunInput::Stdin,
-    };
+    let mut config = Config::new()
+        .fields(&fields)
+        .sorted(args.is_present("sorted"))
+        .whitespace(args.is_present("whitespace"));
 
-    Ok(RunConfig { fields, sorted, whitespace, input })
+    if let Some(inputs) = args.values_of("FILENAME") {
+        for input in inputs {
+            config = config.add_input(input);
+        }
+    }
+
+    Ok(config)
 }
 
 fn parse_field_spec(arg: &str) -> Result<Vec<usize>> {
@@ -188,33 +98,4 @@ fn parse_field_spec(arg: &str) -> Result<Vec<usize>> {
     fields.sort();
     fields.dedup();
     Ok(fields)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn basic() {
-        let config = RunConfig { whitespace: true, ..RunConfig::default() };
-        let mut input = io::Cursor::new(b"a 1 2\na 2 3\nb 1 2\n");
-        let mut output = io::Cursor::new(Vec::new());
-        run(&config, &mut input, &mut output).expect("run to succeed");
-        assert_eq!(
-            String::from_utf8(output.into_inner()).unwrap(),
-            "a 1 2\nb 1 2\n",
-        );
-    }
-
-    #[test]
-    fn column_2() {
-        let config = RunConfig { whitespace: true, fields: vec![1], ..RunConfig::default() };
-        let mut input = io::Cursor::new(b"a 1 2\na 2 3\nb 1 2\n");
-        let mut output = io::Cursor::new(Vec::new());
-        run(&config, &mut input, &mut output).expect("run to succeed");
-        assert_eq!(
-            String::from_utf8(output.into_inner()).unwrap(),
-            "a 1 2\na 2 3\n",
-        );
-    }
 }
