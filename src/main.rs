@@ -13,12 +13,12 @@ use config::Config;
 type Result<T> = std::result::Result<T, Box<error::Error>>;
 
 fn main() -> Result<()> {
-    let config = get_config()?;
+    let config = get_config();
     let mut out = io::stdout();
     tsvfirst::run(&config, &mut out)
 }
 
-fn get_config() -> Result<Config> {
+fn get_config() -> Config {
     let args = app_from_crate!()
         .usage("tsvfirst [-f 1,2] [-s] [-w] <file or stdin>")
         .arg(Arg::with_name("fields")
@@ -76,8 +76,7 @@ The filename of '-' (a single dash) is also taken to mean standard input."))
             config = config.add_input(input);
         }
     }
-
-    Ok(config)
+    config
 }
 
 fn parse_field_spec(arg: &str) -> Result<Vec<usize>> {
